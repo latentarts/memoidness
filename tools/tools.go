@@ -10,6 +10,7 @@ import (
 type Env struct {
 	WorkingDir string
 	Policy     policy.SessionPolicy
+	Emit       func(types.ToolProgress) error
 }
 
 type Tool interface {

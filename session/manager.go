@@ -11,6 +11,7 @@ import (
 )
 
 var ErrSessionNotFound = errors.New("session not found")
+var ErrUnsupportedOperation = errors.New("unsupported session operation")
 
 type RecordOptions struct {
 	SessionID   string

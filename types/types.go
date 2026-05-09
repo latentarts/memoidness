@@ -87,6 +87,13 @@ type ToolResult struct {
 	Error   *Diagnostic
 }
 
+type ToolProgress struct {
+	CallID   string
+	Stream   string
+	Text     string
+	ExitCode *int
+}
+
 type ModelRequest struct {
 	Model           ModelRef
 	Instructions    []InstructionSource
@@ -109,6 +116,17 @@ type ModelResponse struct {
 	Usage        Usage
 	StopReason   string
 	ProviderMeta map[string]any
+}
+
+type MessageDelta struct {
+	MessageID string
+	Delta     string
+}
+
+type RuntimeError struct {
+	Code    string
+	Message string
+	Detail  string
 }
 
 type UserInput struct {
@@ -161,4 +179,37 @@ type SessionEntry struct {
 	Diagnostic *Diagnostic
 	ParentID   string
 	At         time.Time
+}
+
+type ToolReadFileArgs struct {
+	Path string `json:"path"`
+}
+
+type ToolReadFileResult struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type ToolWriteFileArgs struct {
+	Path   string `json:"path"`
+	Text   string `json:"text"`
+	Append bool   `json:"append"`
+}
+
+type ToolWriteFileResult struct {
+	Path    string `json:"path"`
+	Bytes   int    `json:"bytes"`
+	Append  bool   `json:"append"`
+	Written bool   `json:"written"`
+}
+
+type ToolExecArgs struct {
+	Command []string `json:"command"`
+}
+
+type ToolExecResult struct {
+	Command  []string `json:"command"`
+	Stdout   string   `json:"stdout"`
+	Stderr   string   `json:"stderr"`
+	ExitCode int      `json:"exit_code"`
 }

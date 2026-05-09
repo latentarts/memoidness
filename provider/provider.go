@@ -15,7 +15,7 @@ type Provider interface {
 	ID() string
 	SupportsStreaming() bool
 	Execute(ctx context.Context, req types.ModelRequest) (types.ModelResponse, error)
-	StreamCompletion(ctx context.Context, req types.ModelRequest, sink events.Sink) error
+	StreamCompletion(ctx context.Context, req types.ModelRequest, sink events.Sink) (types.ModelResponse, error)
 }
 
 type Registry interface {

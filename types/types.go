@@ -10,6 +10,27 @@ type ModelRef struct {
 	ID         string
 }
 
+type PrincipalRef struct {
+	ID string
+}
+
+type WorkspaceRef struct {
+	ID string
+}
+
+type WorkspaceSpec struct {
+	Ref           WorkspaceRef
+	Kind          string
+	WorkingDir    string
+	RemoteProject string
+	ContextRoots  []string
+}
+
+type SessionScope struct {
+	Principal PrincipalRef
+	Workspace WorkspaceSpec
+}
+
 type DiscoveryMode string
 
 const (
@@ -123,6 +144,35 @@ type MessageDelta struct {
 	Delta     string
 }
 
+type ModeRef struct {
+	ID string
+}
+
+type CapabilityRef struct {
+	ID       string
+	Category string
+}
+
+type CapabilityDescriptor struct {
+	Ref          CapabilityRef
+	Name         string
+	Description  string
+	DefaultOn    bool
+	Dependencies []CapabilityRef
+}
+
+type MCPServerRef struct {
+	ID string
+}
+
+type MCPServerDescriptor struct {
+	Ref          MCPServerRef
+	Name         string
+	SourceKind   string
+	DefaultOn    bool
+	Capabilities []string
+}
+
 type RuntimeError struct {
 	Code    string
 	Message string
@@ -138,6 +188,40 @@ type PromptOptions struct {
 	Stream bool
 }
 
+type SkillPromotionTarget string
+
+const (
+	SkillPromotionTargetWorkspace SkillPromotionTarget = "workspace"
+	SkillPromotionTargetPrincipal SkillPromotionTarget = "principal"
+)
+
+type SkillPromotionRequest struct {
+	Name   string
+	Target SkillPromotionTarget
+}
+
+type SkillPromotionResult struct {
+	Name   string
+	Target SkillPromotionTarget
+	Path   string
+	Source string
+}
+
+type SubagentRequest struct {
+	SessionID string
+	Scope     *SessionScope
+	Mode      *ModeRef
+	Model     *ModelRef
+	ToolAllowlist []string
+	Input     UserInput
+	Options   PromptOptions
+}
+
+type SubagentResult struct {
+	SessionRef SessionRef
+	Run        RunResult
+}
+
 type CompactOptions struct {
 	KeepRecentMessages int
 }
@@ -148,6 +232,8 @@ type CompactResult struct {
 
 type SessionSnapshot struct {
 	SessionID string
+	Scope     SessionScope
+	Mode      ModeRef
 	Messages  []Message
 	BranchID  string
 }
@@ -162,7 +248,9 @@ type RunResult struct {
 }
 
 type SessionRef struct {
-	ID string
+	ID        string
+	Principal string
+	Workspace string
 }
 
 type EntryRef struct {
@@ -170,15 +258,22 @@ type EntryRef struct {
 }
 
 type SessionEntry struct {
-	ID         string
-	Kind       string
-	Message    *Message
-	ToolCall   *ToolCall
-	ToolResult *ToolResult
-	Summary    *Message
-	Diagnostic *Diagnostic
-	ParentID   string
-	At         time.Time
+	ID            string
+	Kind          string
+	Message       *Message
+	ToolCall      *ToolCall
+	ToolResult    *ToolResult
+	Summary       *Message
+	Diagnostic    *Diagnostic
+	SkillPromotion *SkillPromotionResult
+	ToolAllowlist []string
+	ParentID      string
+	ParentSession *SessionRef
+	Mode          *ModeRef
+	Capability    *CapabilityRef
+	MCPServers    []MCPServerDescriptor
+	Subagent      *SessionRef
+	At            time.Time
 }
 
 type ToolReadFileArgs struct {

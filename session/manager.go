@@ -15,24 +15,30 @@ var ErrUnsupportedOperation = errors.New("unsupported session operation")
 
 type RecordOptions struct {
 	SessionID   string
-	WorkingDir  string
+	Scope       types.SessionScope
+	Mode        types.ModeRef
 	Model       types.ModelRef
 	Persistence types.PersistenceMode
 }
 
 type Scope struct {
-	WorkingDir string
+	Principal string
+	Workspace string
 }
 
 type Summary struct {
 	ID        string
+	Principal string
+	Workspace string
+	Mode      types.ModeRef
 	Model     types.ModelRef
 	UpdatedAt time.Time
 }
 
 type Record struct {
 	SessionID   string
-	WorkingDir  string
+	Scope       types.SessionScope
+	Mode        types.ModeRef
 	Model       types.ModelRef
 	BranchID    string
 	Entries     []types.SessionEntry
@@ -42,7 +48,11 @@ type Record struct {
 }
 
 func (r *Record) Ref() types.SessionRef {
-	return types.SessionRef{ID: r.SessionID}
+	return types.SessionRef{
+		ID:        r.SessionID,
+		Principal: r.Scope.Principal.ID,
+		Workspace: r.Scope.Workspace.Ref.ID,
+	}
 }
 
 type Manager interface {
@@ -83,7 +93,8 @@ func (m *InMemoryManager) New(_ context.Context, opts RecordOptions) (*Record, e
 	now := time.Now().UTC()
 	record := &Record{
 		SessionID:   id,
-		WorkingDir:  opts.WorkingDir,
+		Scope:       opts.Scope,
+		Mode:        opts.Mode,
 		Model:       opts.Model,
 		BranchID:    "main",
 		CreatedAt:   now,
@@ -91,8 +102,8 @@ func (m *InMemoryManager) New(_ context.Context, opts RecordOptions) (*Record, e
 		Persistence: opts.Persistence,
 	}
 	m.records[id] = record
-	if opts.WorkingDir != "" {
-		m.recents[opts.WorkingDir] = id
+	if key := recentKey(opts.Scope); key != "" {
+		m.recents[key] = id
 	}
 	return cloneRecord(record), nil
 }
@@ -112,9 +123,9 @@ func (m *InMemoryManager) ContinueRecent(_ context.Context, scope Scope) (*Recor
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	id, ok := m.recents[scope.WorkingDir]
+	id, ok := m.recents[scopeKey(scope)]
 	if !ok {
-		return nil, fmt.Errorf("%w: recent session for %s", ErrSessionNotFound, scope.WorkingDir)
+		return nil, fmt.Errorf("%w: recent session for %s/%s", ErrSessionNotFound, scope.Principal, scope.Workspace)
 	}
 	record, ok := m.records[id]
 	if !ok {
@@ -123,16 +134,27 @@ func (m *InMemoryManager) ContinueRecent(_ context.Context, scope Scope) (*Recor
 	return cloneRecord(record), nil
 }
 
-func (m *InMemoryManager) Fork(ctx context.Context, ref types.SessionRef, _ types.EntryRef) (*Record, error) {
-	return m.cloneLike(ctx, ref, "fork")
+func (m *InMemoryManager) Fork(ctx context.Context, ref types.SessionRef, at types.EntryRef) (*Record, error) {
+	return m.branchLike(ctx, ref, "fork", at)
 }
 
 func (m *InMemoryManager) Clone(ctx context.Context, ref types.SessionRef) (*Record, error) {
-	return m.cloneLike(ctx, ref, "clone")
+	return m.branchLike(ctx, ref, "clone", types.EntryRef{})
 }
 
-func (m *InMemoryManager) Navigate(ctx context.Context, ref types.SessionRef, _ types.EntryRef) (*Record, error) {
-	return m.Open(ctx, ref)
+func (m *InMemoryManager) Navigate(_ context.Context, ref types.SessionRef, target types.EntryRef) (*Record, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	record, ok := m.records[ref.ID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, ref.ID)
+	}
+	navigated, err := cloneThrough(record, target)
+	if err != nil {
+		return nil, err
+	}
+	return navigated, nil
 }
 
 func (m *InMemoryManager) Append(_ context.Context, ref types.SessionRef, entry types.SessionEntry) error {
@@ -146,8 +168,8 @@ func (m *InMemoryManager) Append(_ context.Context, ref types.SessionRef, entry 
 
 	record.Entries = append(record.Entries, entry)
 	record.UpdatedAt = time.Now().UTC()
-	if record.WorkingDir != "" {
-		m.recents[record.WorkingDir] = record.SessionID
+	if key := recentKey(record.Scope); key != "" {
+		m.recents[key] = record.SessionID
 	}
 	return nil
 }
@@ -158,11 +180,17 @@ func (m *InMemoryManager) List(_ context.Context, scope Scope) ([]Summary, error
 
 	summaries := make([]Summary, 0, len(m.records))
 	for _, record := range m.records {
-		if scope.WorkingDir != "" && record.WorkingDir != scope.WorkingDir {
+		if scope.Principal != "" && record.Scope.Principal.ID != scope.Principal {
+			continue
+		}
+		if scope.Workspace != "" && record.Scope.Workspace.Ref.ID != scope.Workspace {
 			continue
 		}
 		summaries = append(summaries, Summary{
 			ID:        record.SessionID,
+			Principal: record.Scope.Principal.ID,
+			Workspace: record.Scope.Workspace.Ref.ID,
+			Mode:      record.Mode,
 			Model:     record.Model,
 			UpdatedAt: record.UpdatedAt,
 		})
@@ -170,7 +198,7 @@ func (m *InMemoryManager) List(_ context.Context, scope Scope) ([]Summary, error
 	return summaries, nil
 }
 
-func (m *InMemoryManager) cloneLike(_ context.Context, ref types.SessionRef, prefix string) (*Record, error) {
+func (m *InMemoryManager) branchLike(_ context.Context, ref types.SessionRef, prefix string, at types.EntryRef) (*Record, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -182,15 +210,54 @@ func (m *InMemoryManager) cloneLike(_ context.Context, ref types.SessionRef, pre
 	m.sequence++
 	id := fmt.Sprintf("%s-%d", prefix, m.sequence)
 	copyRecord := cloneRecord(record)
+	if at.ID != "" {
+		navigated, err := cloneThrough(record, at)
+		if err != nil {
+			return nil, err
+		}
+		copyRecord = navigated
+	}
 	copyRecord.SessionID = id
 	copyRecord.BranchID = id
 	copyRecord.CreatedAt = time.Now().UTC()
 	copyRecord.UpdatedAt = copyRecord.CreatedAt
+	marker := types.SessionEntry{
+		ID:            fmt.Sprintf("branch-%d", m.sequence),
+		Kind:          "branch_marker",
+		ParentSession: &ref,
+		At:            copyRecord.CreatedAt,
+	}
+	if len(copyRecord.Entries) > 0 {
+		marker.ParentID = copyRecord.Entries[len(copyRecord.Entries)-1].ID
+	}
+	copyRecord.Entries = append([]types.SessionEntry{marker}, copyRecord.Entries...)
 	m.records[id] = copyRecord
-	if copyRecord.WorkingDir != "" {
-		m.recents[copyRecord.WorkingDir] = id
+	if key := recentKey(copyRecord.Scope); key != "" {
+		m.recents[key] = id
 	}
 	return cloneRecord(copyRecord), nil
+}
+
+func cloneThrough(record *Record, target types.EntryRef) (*Record, error) {
+	cloned := cloneRecord(record)
+	if target.ID == "" {
+		return cloned, nil
+	}
+	index := -1
+	for i, entry := range record.Entries {
+		if entry.ID == target.ID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return nil, fmt.Errorf("%w: entry %s", ErrSessionNotFound, target.ID)
+	}
+	cloned.Entries = append([]types.SessionEntry(nil), record.Entries[:index+1]...)
+	if at := cloned.Entries[len(cloned.Entries)-1].At; !at.IsZero() {
+		cloned.UpdatedAt = at
+	}
+	return cloned, nil
 }
 
 func cloneRecord(record *Record) *Record {
@@ -202,7 +269,8 @@ func cloneRecord(record *Record) *Record {
 	copy(entries, record.Entries)
 	return &Record{
 		SessionID:   record.SessionID,
-		WorkingDir:  record.WorkingDir,
+		Scope:       record.Scope,
+		Mode:        record.Mode,
 		Model:       record.Model,
 		BranchID:    record.BranchID,
 		Entries:     entries,
@@ -210,4 +278,18 @@ func cloneRecord(record *Record) *Record {
 		UpdatedAt:   record.UpdatedAt,
 		Persistence: record.Persistence,
 	}
+}
+
+func recentKey(scope types.SessionScope) string {
+	return scopeKey(Scope{
+		Principal: scope.Principal.ID,
+		Workspace: scope.Workspace.Ref.ID,
+	})
+}
+
+func scopeKey(scope Scope) string {
+	if scope.Principal == "" && scope.Workspace == "" {
+		return ""
+	}
+	return scope.Principal + "::" + scope.Workspace
 }

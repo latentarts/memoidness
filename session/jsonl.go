@@ -27,13 +27,14 @@ type JSONLManager struct {
 type sessionLine struct {
 	Kind        string              `json:"kind"`
 	SessionID   string              `json:"session_id,omitempty"`
-	WorkingDir  string              `json:"working_dir,omitempty"`
+	Scope       *types.SessionScope `json:"scope,omitempty"`
+	Mode        *types.ModeRef      `json:"mode,omitempty"`
 	Model       *types.ModelRef     `json:"model,omitempty"`
 	BranchID    string              `json:"branch_id,omitempty"`
 	Persistence types.PersistenceMode `json:"persistence,omitempty"`
-	CreatedAt   time.Time           `json:"created_at,omitempty"`
-	UpdatedAt   time.Time           `json:"updated_at,omitempty"`
-	Entry       *types.SessionEntry `json:"entry,omitempty"`
+	CreatedAt   time.Time             `json:"created_at,omitempty"`
+	UpdatedAt   time.Time             `json:"updated_at,omitempty"`
+	Entry       *types.SessionEntry   `json:"entry,omitempty"`
 }
 
 func NewJSONLManager(root string) (*JSONLManager, error) {
@@ -57,7 +58,8 @@ func (m *JSONLManager) New(ctx context.Context, opts RecordOptions) (*Record, er
 	now := time.Now().UTC()
 	record := &Record{
 		SessionID:   id,
-		WorkingDir:  opts.WorkingDir,
+		Scope:       opts.Scope,
+		Mode:        opts.Mode,
 		Model:       opts.Model,
 		BranchID:    "main",
 		CreatedAt:   now,
@@ -89,7 +91,7 @@ func (m *JSONLManager) ContinueRecent(ctx context.Context, scope Scope) (*Record
 		return nil, err
 	}
 	if len(summaries) == 0 {
-		return nil, fmt.Errorf("%w: recent session for %s", ErrSessionNotFound, scope.WorkingDir)
+		return nil, fmt.Errorf("%w: recent session for %s/%s", ErrSessionNotFound, scope.Principal, scope.Workspace)
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
@@ -97,16 +99,23 @@ func (m *JSONLManager) ContinueRecent(ctx context.Context, scope Scope) (*Record
 	return m.readRecord(summaries[0].ID)
 }
 
-func (m *JSONLManager) Fork(context.Context, types.SessionRef, types.EntryRef) (*Record, error) {
-	return nil, ErrUnsupportedOperation
+func (m *JSONLManager) Fork(ctx context.Context, ref types.SessionRef, at types.EntryRef) (*Record, error) {
+	return m.branchLike(ctx, ref, "fork", at)
 }
 
-func (m *JSONLManager) Clone(context.Context, types.SessionRef) (*Record, error) {
-	return nil, ErrUnsupportedOperation
+func (m *JSONLManager) Clone(ctx context.Context, ref types.SessionRef) (*Record, error) {
+	return m.branchLike(ctx, ref, "clone", types.EntryRef{})
 }
 
-func (m *JSONLManager) Navigate(context.Context, types.SessionRef, types.EntryRef) (*Record, error) {
-	return nil, ErrUnsupportedOperation
+func (m *JSONLManager) Navigate(ctx context.Context, ref types.SessionRef, target types.EntryRef) (*Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	record, err := m.readRecord(ref.ID)
+	if err != nil {
+		return nil, err
+	}
+	return cloneThrough(record, target)
 }
 
 func (m *JSONLManager) Append(ctx context.Context, ref types.SessionRef, entry types.SessionEntry) error {
@@ -158,11 +167,17 @@ func (m *JSONLManager) List(ctx context.Context, scope Scope) ([]Summary, error)
 		if err != nil {
 			return nil, err
 		}
-		if scope.WorkingDir != "" && record.WorkingDir != scope.WorkingDir {
+		if scope.Principal != "" && record.Scope.Principal.ID != scope.Principal {
+			continue
+		}
+		if scope.Workspace != "" && record.Scope.Workspace.Ref.ID != scope.Workspace {
 			continue
 		}
 		summaries = append(summaries, Summary{
 			ID:        record.SessionID,
+			Principal: record.Scope.Principal.ID,
+			Workspace: record.Scope.Workspace.Ref.ID,
+			Mode:      record.Mode,
 			Model:     record.Model,
 			UpdatedAt: record.UpdatedAt,
 		})
@@ -180,7 +195,8 @@ func (m *JSONLManager) writeHeader(record *Record) error {
 	return writeJSONL(file, sessionLine{
 		Kind:        "session",
 		SessionID:   record.SessionID,
-		WorkingDir:  record.WorkingDir,
+		Scope:       &record.Scope,
+		Mode:        &record.Mode,
 		Model:       &record.Model,
 		BranchID:    record.BranchID,
 		Persistence: record.Persistence,
@@ -222,9 +238,13 @@ func (m *JSONLManager) readRecordLocked(id string) (*Record, error) {
 				if decoded.Model == nil {
 					return nil, fmt.Errorf("%w: missing session model", ErrMalformedSession)
 				}
+				if decoded.Scope == nil {
+					return nil, fmt.Errorf("%w: missing session scope", ErrMalformedSession)
+				}
 				record = &Record{
 					SessionID:   decoded.SessionID,
-					WorkingDir:  decoded.WorkingDir,
+					Scope:       *decoded.Scope,
+					Mode:        derefMode(decoded.Mode),
 					Model:       *decoded.Model,
 					BranchID:    decoded.BranchID,
 					CreatedAt:   decoded.CreatedAt,
@@ -253,6 +273,68 @@ func (m *JSONLManager) readRecordLocked(id string) (*Record, error) {
 		return nil, fmt.Errorf("%w: missing session header", ErrMalformedSession)
 	}
 	return cloneRecord(record), nil
+}
+
+func (m *JSONLManager) branchLike(ctx context.Context, ref types.SessionRef, prefix string, at types.EntryRef) (*Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	record, err := m.readRecordLocked(ref.ID)
+	if err != nil {
+		return nil, err
+	}
+	if at.ID != "" {
+		record, err = cloneThrough(record, at)
+		if err != nil {
+			return nil, err
+		}
+	}
+	id := fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
+	now := time.Now().UTC()
+	record.SessionID = id
+	record.BranchID = id
+	record.CreatedAt = now
+	record.UpdatedAt = now
+	marker := types.SessionEntry{
+		ID:            fmt.Sprintf("branch-%d", now.UnixNano()),
+		Kind:          "branch_marker",
+		ParentSession: &ref,
+		At:            now,
+	}
+	if len(record.Entries) > 0 {
+		marker.ParentID = record.Entries[len(record.Entries)-1].ID
+	}
+	record.Entries = append([]types.SessionEntry{marker}, record.Entries...)
+	if err := m.writeHeader(record); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(m.sessionPath(record.SessionID), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	for _, entry := range record.Entries {
+		line := sessionLine{
+			Kind:      "entry",
+			SessionID: record.SessionID,
+			UpdatedAt: record.UpdatedAt,
+			Entry:     &entry,
+		}
+		if err := writeJSONL(file, line); err != nil {
+			return nil, err
+		}
+	}
+	return cloneRecord(record), nil
+}
+
+func derefMode(mode *types.ModeRef) types.ModeRef {
+	if mode == nil {
+		return types.ModeRef{}
+	}
+	return *mode
 }
 
 func (m *JSONLManager) sessionPath(id string) string {

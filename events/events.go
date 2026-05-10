@@ -9,6 +9,8 @@ type RuntimeEvent interface {
 type Envelope struct {
 	ID        string
 	Type      string
+	Principal string
+	Workspace string
 	SessionID string
 	TurnID    string
 	At        time.Time

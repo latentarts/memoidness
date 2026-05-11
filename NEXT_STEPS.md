@@ -13,22 +13,25 @@ The runtime core now has:
 - same-process subagents with orchestration gating and child tool narrowing
 - durable session branching through `Fork`, `Clone`, and `Navigate`
 - a thin adapter-facing `service.Service` integration layer
+- an initial `adapter/cli` package built on top of `service.Service`
+- an initial `adapter/rest` package built on top of `service.Service`
+- an initial `adapter/rpc` package built on top of `service.Service`
 
 ## Immediate Next Step
 
-Build the first real host adapter.
+Broaden and harden the first real host adapters.
 
 Recommended order:
 
-1. add `adapter/cli`
-2. keep it thin and make it depend only on `service.Service` plus transport/rendering code
-3. validate the full lifecycle through the CLI:
+1. keep `adapter/cli`, `adapter/rest`, and `adapter/rpc` thin and make them depend only on `service.Service` plus transport/rendering code
+2. validate and extend the shared lifecycle coverage through all adapters:
    - create/open/continue
-   - prompt with streaming output
+   - prompt with streaming output or event delivery
    - steer/follow-up/abort
    - fork/clone/navigate
    - promote-skill
    - set-mode
+3. add any missing service-facing support that both adapters need, especially around richer history inspection
 
 ## Design Constraints
 
@@ -37,13 +40,12 @@ Recommended order:
 - keep event semantics identical to the runtime event stream
 - prefer request/response translation over adapter-specific agent behavior
 
-## After CLI
+## After The First Adapter Trio
 
-Once the CLI shape is stable:
+Once the CLI, REST, and RPC shapes are stable:
 
-1. add `adapter/rest`
-2. add `adapter/rpc`
-3. reuse the same `service.Service` operations and event semantics
+1. harden shared inspection and history surfaces
+2. preserve the same `service.Service` operations and event semantics across all transports
 
 ## Still Open
 

@@ -2,34 +2,79 @@
 
 `memoidness` is a library-first Go runtime for building coding agents.
 
-It provides the core loop you need to run an agent against an arbitrary codebase:
+It gives you one reusable backend surface for:
+
+- scoped sessions
+- OpenAI-compatible model execution
+- repository instruction loading
+- policy-gated filesystem and process tools
+- ordered runtime events
+- resumable JSONL session persistence
+- branching, replay, and navigation
+- generated-skill promotion
+- thin CLI, REST, and RPC adapter packages
+
+The project is meant to be embedded into another Go application. It is not a packaged end-user agent product.
+
+## Architecture At A Glance
+
+```mermaid
+flowchart TD
+    Host[Your Host Application]
+    CLI[adapter/cli]
+    REST[adapter/rest]
+    RPC[adapter/rpc]
+    Service[service.Service]
+    Runtime[runtime.Runtime]
+    Provider[provider]
+    Tools[tools]
+    Resources[resources]
+    Capabilities[capabilities]
+    MCP[mcp]
+    SessionStore[session JSONL or in-memory]
+    Workspace[Target Workspace]
+
+    Host --> CLI
+    Host --> REST
+    Host --> RPC
+    Host --> Service
+    CLI --> Service
+    REST --> Service
+    RPC --> Service
+    Service --> Runtime
+    Runtime --> Provider
+    Runtime --> Tools
+    Runtime --> Resources
+    Runtime --> Capabilities
+    Runtime --> MCP
+    Runtime --> SessionStore
+    Runtime --> Workspace
+```
+
+## Status
+
+The current implementation is an MVP backend runtime, but it is already usable for real embedding work.
+
+Implemented:
 
 - session-oriented runtime API
-- OpenAI-compatible model provider support
-- project instruction loading from local context files
-- model-driven tool execution
-- ordered runtime events
-- resumable session persistence
+- `service.Service` session coordinator for multi-request hosts
+- built-in `read_file`, `write_file`, and `exec` tools
+- OpenAI-compatible `/chat/completions` provider
+- project instruction discovery from local guidance files
+- append-only JSONL session persistence
+- scoped MCP-backed resources and tools
+- mode-aware capability resolution
+- fork, clone, and navigate session branches
+- same-process subagents
+- workspace-skill promotion
+- reusable `adapter/cli`, `adapter/rest`, and `adapter/rpc` packages
 
-The project is intended to be embedded inside another host application rather than used as a CLI by itself. A host can be a terminal app, HTTP service, RPC daemon, test harness, or any other Go process that needs coding-agent behavior.
+Not yet packaged:
 
-## Current Status
-
-The current implementation is an MVP backend runtime.
-
-It is functional for:
-
-- creating and reopening sessions
-- loading repository guidance files before a turn
-- sending prompts to an OpenAI-compatible chat-completions endpoint
-- executing built-in filesystem and process tools under policy
-- streaming ordered runtime events to subscribers
-- persisting session history as append-only JSONL
-- resolving scoped MCP-backed resources and tools
-- promoting generated workspace skills explicitly
-- forking, cloning, and replaying session history branches
-
-It is not yet a full end-user product. There is still no built-in CLI, REST server, or RPC server in this repository, but the library now includes a thin adapter-facing `service` package intended to be the integration seam for those hosts.
+- end-user CLI binary
+- REST server binary
+- standalone RPC daemon
 
 ## Installation
 
@@ -38,35 +83,227 @@ Requirements:
 - Go `1.24`
 - access to an OpenAI-compatible API endpoint
 
-Add the module to your Go project:
+Install:
 
 ```bash
 go get github.com/latentarts/memoidness
 ```
 
-## Integration Model
+## Core Model
 
-There are now two supported ways to embed `memoidness`:
+The intended dependency direction is:
 
-1. direct runtime integration
-2. adapter-oriented integration through `service.Service`
+| Layer | Packages | What It Is |
+|---|---|---|
+| Core runtime layer | `runtime`, `provider`, `session`, `tools`, `resources`, `capabilities`, `mcp`, `policy`, `types` | The reusable backend engine. This layer owns session behavior, model execution, persistence, tool execution, capability resolution, resource loading, normalized types, and safety policy. |
+| Coordination layer | `service` | A thin session coordinator over the runtime. This is the preferred host seam for multi-request systems because it handles session lookup, reopen, and rebinding so transport code does not manage live runtime sessions directly. |
+| Transport layer | `adapter/cli`, `adapter/rest`, `adapter/rpc` | Thin transport adapters over `service.Service`. These packages translate terminal commands, HTTP requests, or framed RPC messages into normalized service calls and stream runtime events back outward. |
 
-If you are building a CLI, REST API, RPC daemon, or any multi-request host, prefer `service.Service`. It owns session lookup and rebinding so adapters do not have to juggle `runtime.Session` objects directly.
+The runtime owns behavior. Hosts and adapters should stay thin.
 
-The typical assembly pattern is:
+Use the layers like this:
 
-1. resolve principal and workspace scope
-2. configure a provider registry
-3. configure durable session storage
-4. configure filesystem and process policy
-5. build `runtime.Runtime`
-6. optionally wrap it in `service.Service`
+- use `runtime.Runtime` directly when you are embedding a single in-process agent and are comfortable holding `runtime.Session` values yourself
+- use `service.Service` when you are building any multi-request or transport-facing host
+- use adapter packages when you want a ready-made transport seam over `service.Service`
 
-## How To Use It In Another Codebase
+## Main Runtime Flow
 
-### Recommended Host Wiring
+```mermaid
+sequenceDiagram
+    participant Host
+    participant Service
+    participant Runtime
+    participant Loader as Resource Loader
+    participant Provider
+    participant Tools
+    participant Store as Session Store
+    participant Events
 
-This is the recommended integration point for a host adapter:
+    Host->>Service: Prompt(ref, input, opts)
+    Service->>Runtime: Resolve or open session
+    Runtime->>Loader: Load instructions and skills
+    Runtime->>Store: Append user/session state
+    Runtime->>Events: Emit turn_start / capability events
+    Runtime->>Provider: Execute model request
+    Provider-->>Runtime: Assistant output + tool calls
+    Runtime->>Events: Emit message deltas
+    Runtime->>Tools: Execute allowed tools
+    Tools-->>Runtime: Tool results
+    Runtime->>Store: Append tool calls/results and messages
+    Runtime->>Events: Emit tool and turn_end events
+    Runtime-->>Service: RunResult
+    Service-->>Host: Final result
+```
+
+## Transport Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Adapter as CLI/REST/RPC Adapter
+    participant Service
+    participant Runtime
+    participant EventSub as Event Subscription
+
+    Client->>Adapter: Transport request
+    Adapter->>Service: Normalized call
+    Service->>Runtime: Session operation
+    Runtime->>EventSub: Ordered runtime events
+    EventSub-->>Adapter: Normalized events
+    Runtime-->>Service: Result or error
+    Service-->>Adapter: Result
+    Adapter-->>Client: Transport response + streamed events
+```
+
+## Features
+
+### Sessions
+
+Sessions support:
+
+| Operation | Description |
+|---|---|
+| `Prompt` | Run a user turn through the model and tool loop. |
+| `Steer` | Queue developer-style guidance while a turn is active. |
+| `FollowUp` | Queue another user-style input while a turn is active. |
+| `Abort` | Cancel the currently running turn. |
+| `SetMode` | Change the active session mode, such as `plan` or `implementation`. |
+| `Fork` | Create a new branch from the current or earlier session history. |
+| `Clone` | Copy the current session history into a new branch. |
+| `Navigate` | Replay the session to an earlier visible entry. |
+| `PromoteSkill` | Persist an ephemeral generated skill to workspace scope. |
+| `Compact` | Append a summary record for compaction-oriented workflows. |
+| `Subscribe` | Receive ordered runtime events for the session. |
+| `Snapshot` | Read the current session state and visible message history. |
+
+Each session runs through one serialized mutation loop, so prompts, tool calls, persistence, and events all go through the same path.
+
+### Provider
+
+The built-in provider supports:
+
+- custom base URL
+- API key injection
+- non-streaming chat completions
+- streaming assistant deltas
+- tool-call decoding
+
+### Tools
+
+Built-in tools:
+
+| Tool | Description |
+|---|---|
+| `read_file` | Read a UTF-8 text file under allowed readable roots. |
+| `write_file` | Write or append UTF-8 text under allowed writable roots. |
+| `exec` | Run an allowed process and stream `stdout` and `stderr` updates. |
+
+All tool execution is gated by explicit policy.
+
+### Persistence
+
+The JSONL session manager supports:
+
+- create
+- append
+- open by session id
+- continue recent by principal/workspace scope
+- list
+- fork
+- clone
+- navigate to an earlier entry
+
+The durable format is append-only JSONL:
+
+- first line: session metadata
+- later lines: session entries
+
+```mermaid
+flowchart TD
+    SessionStart[Session Header Line]
+    Entry1[Entry: user message]
+    Entry2[Entry: assistant message]
+    Entry3[Entry: tool call]
+    Entry4[Entry: tool result]
+    Entry5[Entry: branch or mode transition]
+
+    SessionStart --> Entry1 --> Entry2 --> Entry3 --> Entry4 --> Entry5
+```
+
+### Capability And MCP Support
+
+The runtime supports:
+
+- plan vs implementation mode
+- mode-based tool narrowing
+- scoped MCP-backed resources
+- scoped MCP-backed tools
+- same-process subagent orchestration
+
+```mermaid
+flowchart LR
+    Scope[Principal + Workspace + Mode]
+    Scope --> Registry[Capability Registry]
+    Scope --> MCPReg[MCP Registry]
+    Registry --> Allowed[Allowed Tools and Resources]
+    MCPReg --> MCPRes[MCP Resources and Tools]
+    Allowed --> Session[Active Session]
+    MCPRes --> Session
+```
+
+### Adapter Packages
+
+Available reusable adapter packages:
+
+- `adapter/cli`
+- `adapter/rest`
+- `adapter/rpc`
+
+These are library packages, not packaged binaries.
+
+## Correct Integration Pattern
+
+For most production-style hosts, the correct pattern is:
+
+1. resolve principal and workspace identity at the host edge
+2. configure provider, policy, persistence, and optional MCP dependencies
+3. build one `runtime.Runtime`
+4. wrap it in one long-lived `service.Service`
+5. mount CLI, REST, or RPC transport behavior on top of `service.Service`
+6. stream normalized runtime events outward without inventing a second orchestration path
+
+Do not put transport-specific business logic into `runtime`.
+
+## Recommended Deployment Shape
+
+```mermaid
+flowchart TD
+    App[Host Process]
+    PolicyCfg[Policy Config]
+    ProviderCfg[Provider Config]
+    StoreCfg[Session Store]
+    RuntimeObj[runtime.Runtime]
+    ServiceObj[service.Service]
+    CLIObj[adapter/cli]
+    RESTObj[adapter/rest]
+    RPCObj[adapter/rpc]
+
+    PolicyCfg --> RuntimeObj
+    ProviderCfg --> RuntimeObj
+    StoreCfg --> RuntimeObj
+    RuntimeObj --> ServiceObj
+    ServiceObj --> CLIObj
+    ServiceObj --> RESTObj
+    ServiceObj --> RPCObj
+    App --> CLIObj
+    App --> RESTObj
+    App --> RPCObj
+```
+
+## Quick Start
+
+### Recommended Host Wiring With `service.Service`
 
 ```go
 package main
@@ -90,7 +327,7 @@ import (
 func main() {
 	ctx := context.Background()
 
-	targetRepo := "/path/to/another/codebase"
+	targetRepo := "/path/to/repo"
 	storeDir := filepath.Join(targetRepo, ".memoidness", "sessions")
 
 	sessionManager, err := session.NewJSONLManager(storeDir)
@@ -99,14 +336,14 @@ func main() {
 	}
 
 	modelProvider := provider.NewOpenAICompatibleProvider(provider.OpenAIConfig{
-		ID:      "local-openai",
+		ID:      "openai-like",
 		BaseURL: "https://your-openai-compatible-host/v1",
 		APIKey:  os.Getenv("OPENAI_API_KEY"),
 		Client:  http.DefaultClient,
 	})
 
 	rt := runtime.New(runtime.Config{
-		Providers:      provider.NewStaticRegistry("local-openai", modelProvider),
+		Providers:      provider.NewStaticRegistry("openai-like", modelProvider),
 		SessionManager: sessionManager,
 		Policy: policy.RuntimePolicy{
 			Filesystem: policy.FilesystemPolicy{
@@ -115,9 +352,8 @@ func main() {
 			},
 			Process: policy.ProcessPolicy{
 				AllowedCommands: []string{
-					"go test",
-					"go build",
 					"git status",
+					"go test",
 					"rg",
 				},
 			},
@@ -129,7 +365,7 @@ func main() {
 	snapshot, err := svc.CreateSession(ctx, service.CreateSessionRequest{
 		Options: runtime.SessionOptions{
 			Model: types.ModelRef{
-				ProviderID: "local-openai",
+				ProviderID: "openai-like",
 				ID:         "gpt-4.1-mini",
 			},
 			Scope: types.SessionScope{
@@ -161,7 +397,7 @@ func main() {
 	}
 
 	result, err := svc.Prompt(ctx, ref, types.UserInput{
-		Text: "Read the repository instructions, inspect the project, and explain the test layout.",
+		Text: "Read the repository guidance and explain the test layout.",
 	}, types.PromptOptions{
 		Stream: true,
 	})
@@ -175,12 +411,14 @@ func main() {
 
 ### Direct Runtime Integration
 
-If you are embedding `memoidness` inside a single in-process application and you do not need a session coordinator, you can still use `runtime.Runtime` directly:
+Use direct runtime integration only when you do not need a session coordinator:
+
+Assuming `rt` was built as in the previous example:
 
 ```go
 sess, err := rt.NewSession(ctx, runtime.SessionOptions{
 	Model: types.ModelRef{
-		ProviderID: "local-openai",
+		ProviderID: "openai-like",
 		ID:         "gpt-4.1-mini",
 	},
 	Scope: types.SessionScope{
@@ -196,9 +434,43 @@ sess, err := rt.NewSession(ctx, runtime.SessionOptions{
 if err != nil {
 	log.Fatal(err)
 }
+
+result, err := sess.Prompt(ctx, types.UserInput{
+	Text: "Summarize the repository layout.",
+}, types.PromptOptions{
+	Stream: true,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(result.FinalOutput.Parts[0].Text)
 ```
 
-### Reopening Or Continuing A Session Through The Service Layer
+## Using `service.Service`
+
+`service.Service` is the preferred seam for hosts.
+
+Available operations:
+
+| Operation | Description |
+|---|---|
+| `CreateSession` | Create a new scoped session and return its initial snapshot. |
+| `OpenSession` | Reopen an existing session by explicit session reference. |
+| `ContinueRecent` | Open the most recent session for a principal/workspace scope. |
+| `Prompt` | Run a prompt against a resolved session. |
+| `Steer` | Send developer-style steering input to an active run. |
+| `FollowUp` | Send user-style follow-up input to an active run. |
+| `Abort` | Cancel an active run. |
+| `Fork` | Create a new branch from a visible entry. |
+| `Clone` | Copy the current branch into a new session branch. |
+| `Navigate` | Replay the session to an earlier entry. |
+| `PromoteSkill` | Persist a generated skill into durable workspace scope. |
+| `SetMode` | Switch the active mode for a session. |
+| `Snapshot` | Read the latest session snapshot. |
+| `Subscribe` | Attach an event listener to a session. |
+
+### Open Or Continue A Session
 
 ```go
 snapshot, err := svc.OpenSession(ctx, types.SessionRef{
@@ -219,11 +491,56 @@ recent, err := svc.ContinueRecent(ctx, service.ContinueRecentRequest{
 if err != nil {
 	log.Fatal(err)
 }
+
 _ = snapshot
 _ = recent
 ```
 
-### Branch Operations Through The Service Layer
+### Prompt, Steer, Follow Up, Abort
+
+```go
+result, err := svc.Prompt(ctx, ref, types.UserInput{
+	Text: "Inspect the repository and propose a plan.",
+}, types.PromptOptions{
+	Stream: true,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+_ = result
+
+if err := svc.Steer(ctx, ref, types.UserInput{
+	Text: "Focus on persistence and tests.",
+}); err != nil {
+	log.Fatal(err)
+}
+
+if err := svc.FollowUp(ctx, ref, types.UserInput{
+	Text: "Now summarize the main risks.",
+}); err != nil {
+	log.Fatal(err)
+}
+
+if err := svc.Abort(ctx, ref); err != nil {
+	log.Fatal(err)
+}
+```
+
+`Steer` and `FollowUp` only make sense while a prompt is actively running.
+
+### Set Mode
+
+```go
+snapshot, err := svc.SetMode(ctx, ref, types.ModeRef{ID: "plan"})
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(snapshot.Mode.ID)
+```
+
+### Branching And Navigation
 
 ```go
 forked, err := svc.Fork(ctx, ref, types.EntryRef{ID: "msg-5"})
@@ -246,9 +563,71 @@ _ = cloned
 _ = navigated
 ```
 
-`Fork` and `Navigate` accept ids that come back from visible message or tool history; the runtime resolves them back to persisted entry ids before handing them to the session manager.
+`Fork` and `Navigate` can use ids from visible message or tool history. The runtime resolves them to persisted entry ids.
 
-## What The Runtime Loads From The Target Repository
+### Promote A Generated Skill
+
+```go
+result, err := svc.PromoteSkill(ctx, ref, types.SkillPromotionRequest{
+	Name:   "generated-write-tests",
+	Target: types.SkillPromotionTargetWorkspace,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(result.Path)
+```
+
+## Event Consumption
+
+Runtime events are the correct live integration surface for:
+
+- terminal streaming
+- HTTP event streaming
+- RPC event forwarding
+- logs
+- orchestration and monitoring
+
+Example:
+
+```go
+unsubscribe, err := svc.Subscribe(ctx, ref, func(ev any) {
+	fmt.Printf("runtime event: %#v\n", ev)
+})
+if err != nil {
+	log.Fatal(err)
+}
+defer unsubscribe()
+```
+
+Current event families include:
+
+| Event Family | Description |
+|---|---|
+| `agent_start` | Marks the beginning of a top-level run. |
+| `agent_end` | Marks the end of a top-level run. |
+| `turn_start` | Marks the beginning of a prompt turn. |
+| `turn_end` | Marks the end of a prompt turn. |
+| `message_delta` | Streams incremental assistant text output. |
+| `queue_update` | Reports queued `Steer` or `FollowUp` inputs. |
+| `tool_execution_start` | Marks the start of a tool invocation. |
+| `tool_execution_update` | Streams progress from a running tool. |
+| `tool_execution_end` | Marks the end of a tool invocation. |
+| `capability_resolution` | Reports the effective capability set for the run. |
+| `capability_denial` | Reports a denied tool, mode, or orchestration action. |
+| `mcp_server_resolution` | Reports the effective MCP server set for the run. |
+| `mcp_server_session_start` | Marks the start of an MCP-backed session lifecycle. |
+| `mcp_server_session_end` | Marks the end of an MCP-backed session lifecycle. |
+| `subagent_start` | Marks the start of a child-session delegation. |
+| `subagent_end` | Marks the end of a child-session delegation. |
+| `session_fork` | Reports branch creation through `Fork`. |
+| `session_clone` | Reports branch creation through `Clone`. |
+| `session_navigate` | Reports replay to an earlier entry. |
+| `skill_promotion` | Reports durable promotion of a generated skill. |
+| `error` | Reports a runtime-level failure or terminal error condition. |
+
+## What The Runtime Loads From The Repository
 
 Before the first prompt in a session, the default filesystem resource loader scans the working directory and optional context roots for instruction files:
 
@@ -259,225 +638,284 @@ Before the first prompt in a session, the default filesystem resource loader sca
 - `GEMINI.md`
 - `PI.md`
 
-These files are loaded into the model request as system instructions. Stop paths from `policy.ResourcePolicy.StopPaths` are respected during discovery.
+These are loaded into the model request as instructions.
 
-The default loader also discovers promoted workspace skills under:
+The default loader also discovers workspace skills under:
 
 - `.memoidness/skills/*.md`
 
-## Built-In Functionality
+`policy.ResourcePolicy.StopPaths` is respected during discovery.
 
-### 1. Session Runtime
+## Policy
 
-The runtime exposes:
+You are expected to configure policy explicitly.
 
-- `NewSession`
-- `OpenSession`
-- `Prompt`
-- `Steer`
-- `FollowUp`
-- `Abort`
-- `Fork`
-- `Clone`
-- `Navigate`
-- `PromoteSkill`
-- `Compact`
-- `Subscribe`
-- `Snapshot`
+Important knobs:
 
-Each session runs through a serialized internal loop so prompts, tool execution, persistence, and event emission all happen through one authoritative path.
+| Policy Field | Description |
+|---|---|
+| `Filesystem.ReadableRoots` | Roots that `read_file` may access. |
+| `Filesystem.WritableRoots` | Roots that `write_file` may modify. |
+| `Process.AllowedCommands` | Command prefixes that `exec` may run. |
+| `Process.NetworkAccess` | Host-declared network posture for process execution. |
+| `Resources.StopPaths` | Discovery boundaries for instruction and skill loading. |
 
-### 2. OpenAI-Compatible Provider
+Example:
 
-The built-in provider supports:
+```go
+policy.RuntimePolicy{
+	Filesystem: policy.FilesystemPolicy{
+		ReadableRoots: []string{targetRepo},
+		WritableRoots: []string{targetRepo},
+	},
+	Process: policy.ProcessPolicy{
+		AllowedCommands: []string{
+			"git status",
+			"go test",
+			"rg",
+		},
+	},
+}
+```
 
-- custom base URL
-- API key injection
-- standard chat completions
-- streaming assistant text deltas
-- tool-call decoding from model responses
+If a tool violates policy, the runtime returns a structured tool error rather than bypassing the runtime.
 
-Use it when your model endpoint exposes an OpenAI-style `/chat/completions` API.
+## Persistence
 
-### 3. Adapter-Facing Service Layer
+The recommended durable setup is to store sessions in a project-local directory:
 
-The `service` package provides a thin session coordinator for host adapters.
+- `.memoidness/sessions`
 
-It adds:
+Example:
 
-- session caching by session id
-- `CreateSession`
-- `OpenSession`
-- `ContinueRecent`
-- `Prompt`
-- `Steer`
-- `FollowUp`
-- `Abort`
-- `Fork`
-- `Clone`
-- `Navigate`
-- `PromoteSkill`
-- `SetMode`
-- `Snapshot`
-- `Subscribe`
+```go
+storeDir := filepath.Join(targetRepo, ".memoidness", "sessions")
+manager, err := session.NewJSONLManager(storeDir)
+if err != nil {
+	log.Fatal(err)
+}
+```
 
-This keeps CLI, REST, and RPC adapters thin and transport-focused while preserving the runtime as the single owner of behavior.
+This supports:
 
-### 4. Built-In Tools
+- process restart recovery
+- continue recent by principal/workspace
+- branch persistence
+- later replay or inspection
 
-The default tool registry includes:
+## Adapters
 
-- `read_file`
-- `write_file`
-- `exec`
+All adapters are thin library packages over `service.Service`.
 
-`read_file` reads UTF-8 files under allowed readable roots.
+### CLI Adapter
 
-`write_file` writes or appends UTF-8 text under allowed writable roots.
+Package:
 
-`exec` runs an allowed process and streams `stdout` and `stderr` updates through runtime events.
+- `github.com/latentarts/memoidness/adapter/cli`
 
-### 5. Capability And MCP Integration
+Use it when you want a terminal-oriented command surface inside your own binary.
 
-The runtime now supports:
+Example:
 
-- mode-aware capability resolution
-- same-process subagent orchestration
-- scoped MCP-backed resource and tool providers
-- explicit queue semantics for `Steer` and `FollowUp`
+```go
+cliAdapter, err := cli.New(cli.Config{
+	Service:           svc,
+	Stdout:            os.Stdout,
+	Stderr:            os.Stderr,
+	DefaultPrincipal:  "user-1",
+	DefaultWorkspace:  "repo-1",
+	DefaultWorkingDir: targetRepo,
+	DefaultModel: types.ModelRef{
+		ProviderID: "openai-like",
+		ID:         "gpt-4.1-mini",
+	},
+	DefaultStream: true,
+})
+if err != nil {
+	log.Fatal(err)
+}
 
-MCP integrations are optional and are wired through `Config.MCPRegistry`.
+if err := cliAdapter.Run(ctx, []string{
+	"create",
+	"--principal", "user-1",
+	"--workspace", "repo-1",
+	"--dir", targetRepo,
+}); err != nil {
+	log.Fatal(err)
+}
+```
 
-### 6. Policy Enforcement
+Current commands:
 
-The runtime expects the embedding host to define policy explicitly:
+| Command | Description |
+|---|---|
+| `create` | Create a new session from CLI arguments. |
+| `open` | Open an existing session by explicit session id and scope. |
+| `continue` | Reopen the most recent scoped session. |
+| `prompt` | Run a prompt and optionally stream output. |
+| `snapshot` | Print the current session snapshot. |
+| `set-mode` | Change the session mode. |
+| `fork` | Create a new branch from a visible entry id. |
+| `clone` | Clone the current branch into a new session. |
+| `navigate` | Replay the session to an earlier visible entry id. |
+| `promote-skill` | Persist a generated skill to workspace scope. |
+| `steer` | Queue steering input into an active run. |
+| `follow-up` | Queue follow-up input into an active run. |
+| `abort` | Cancel the active run. |
 
-- `Filesystem.ReadableRoots`
-- `Filesystem.WritableRoots`
-- `Process.AllowedCommands`
-- `Resources.StopPaths`
+### REST Adapter
 
-If a tool call violates policy, the tool result is returned as a structured error instead of bypassing the runtime.
+Package:
 
-### 7. Persistent Sessions
+- `github.com/latentarts/memoidness/adapter/rest`
 
-The JSONL session manager stores append-only session history on disk.
+Use it when you want to mount the runtime into an existing HTTP server.
 
-Current supported durable operations:
+Example:
 
-- create session
-- append entries
-- open session by id
-- continue the most recent session for a principal/workspace scope
-- list sessions
-- fork a new branch from current or prior history
-- clone a session into a new branch
-- replay a session to a prior entry with `Navigate`
+```go
+restAdapter, err := rest.New(rest.Config{
+	Service:  svc,
+	BasePath: "/api",
+})
+if err != nil {
+	log.Fatal(err)
+}
 
-This is enough to resume work across process restarts and preserve turn history for later inspection.
+mux := http.NewServeMux()
+mux.Handle("/api/", restAdapter.Handler())
 
-### 8. Generated Skill Promotion
+if err := http.ListenAndServe(":8080", mux); err != nil {
+	log.Fatal(err)
+}
+```
 
-When no matching skill exists, the runtime can synthesize an ephemeral generated skill for the current session.
+Current endpoints:
 
-That skill remains session-scoped until explicitly promoted. The default promoter writes workspace skills under `.memoidness/skills`.
+| Endpoint | Description |
+|---|---|
+| `POST /sessions` | Create a new session. |
+| `POST /sessions/continue` | Open the most recent scoped session. |
+| `GET /sessions/{session_id}` | Read the current snapshot for a session. |
+| `POST /sessions/{session_id}/prompt` | Run a prompt against a session. |
+| `POST /sessions/{session_id}/steer` | Queue steering input for an active run. |
+| `POST /sessions/{session_id}/follow-up` | Queue follow-up input for an active run. |
+| `POST /sessions/{session_id}/abort` | Cancel the active run. |
+| `POST /sessions/{session_id}/mode` | Change the active mode. |
+| `POST /sessions/{session_id}/fork` | Create a new branch from an earlier entry. |
+| `POST /sessions/{session_id}/clone` | Clone the current branch into a new session. |
+| `POST /sessions/{session_id}/navigate` | Replay the session to an earlier entry. |
+| `POST /sessions/{session_id}/promote-skill` | Persist a generated skill to workspace scope. |
+| `GET /sessions/{session_id}/events` | Stream normalized runtime events as SSE. |
 
-Current support:
+Example request:
 
-- ephemeral generated skills
-- explicit promotion through `Session.PromoteSkill` or `service.Service.PromoteSkill`
-- durable workspace skill rediscovery in later sessions
+```http
+POST /api/sessions HTTP/1.1
+Content-Type: application/json
 
-Not yet supported:
+{
+  "scope": {
+    "Principal": { "ID": "user-1" },
+    "Workspace": {
+      "Ref": { "ID": "repo-1" },
+      "Kind": "local",
+      "WorkingDir": "/path/to/repo"
+    }
+  },
+  "model": {
+    "ProviderID": "openai-like",
+    "ID": "gpt-4.1-mini"
+  },
+  "persistence": "session"
+}
+```
 
-- principal-level promotion
-- global promotion
-- external approval-service integration
+Event streaming currently uses server-sent events from `GET /sessions/{session_id}/events`.
 
-### 9. Event Streaming
+For session-targeted REST routes, the current adapter expects `principal` and `workspace` as query parameters alongside the session id.
 
-Hosts can subscribe to ordered runtime events with `Session.Subscribe`.
+### RPC Adapter
 
-Current event families include:
+Package:
 
-- `agent_start`
-- `turn_start`
-- `message_delta`
-- `message_complete`
-- `queue_update`
-- `tool_execution_start`
-- `tool_execution_update`
-- `tool_execution_end`
-- `capability_resolution`
-- `capability_denial`
-- `mcp_server_resolution`
-- `mcp_server_session_start`
-- `mcp_server_session_end`
-- `skill_promotion`
-- `subagent_start`
-- `subagent_end`
-- `session_fork`
-- `session_clone`
-- `session_navigate`
-- `turn_end`
-- `agent_end`
-- `error`
+- `github.com/latentarts/memoidness/adapter/rpc`
 
-This is the main integration surface for live UIs, logs, streaming APIs, and host-side orchestration.
+Use it when you want an out-of-process command-and-event stream over a duplex connection.
 
-## Recommended Host Integration Pattern
+Example:
 
-For another codebase, the recommended pattern is:
+```go
+func serveRPC(ctx context.Context, conn net.Conn, svc *service.Service) error {
+	rpcServer, err := rpc.New(rpc.Config{
+		Service: svc,
+	})
+	if err != nil {
+		return err
+	}
+	return rpcServer.Serve(ctx, conn)
+}
+```
 
-1. store sessions under a project-local directory such as `.memoidness/sessions`
-2. resolve explicit `Principal` and `Workspace` ids per host request
-3. assemble one `runtime.Runtime` with injected provider, storage, policy, capability, and optional MCP dependencies
-4. wrap it in one long-lived `service.Service`
-5. keep adapters transport-only: translate inbound requests into `service` calls and stream normalized runtime events back out
-6. restrict file and process permissions aggressively
-7. use `Prompt(..., Stream: true)` for interactive hosts
+The first-pass RPC framing is line-oriented JSON.
 
-If you are building adapters, the intended dependency direction is:
+Request envelope:
 
-- `runtime`, `session`, `resources`, `tools`, `provider`, `capabilities`, `mcp`, `types`
-- then `service`
-- then adapter packages such as `cli`, `rest`, or `rpc`
+```json
+{"id":"req-1","method":"prompt","params":{"ref":{"id":"session-1","principal":"user-1","workspace":"repo-1"},"input":{"text":"inspect repo"},"options":{"stream":true}}}
+```
 
-The adapters should not own agent behavior. They should only:
+Response envelope:
 
-- resolve scope and auth at the edge
-- serialize and deserialize transport payloads
-- subscribe to runtime events
-- call `service.Service`
+```json
+{"id":"req-1","type":"response","method":"prompt","payload":{...}}
+```
 
-## Roadmap
+Event envelope:
 
-Still pending:
+```json
+{"id":"sub-1","type":"event","method":"subscribe","payload":{...}}
+```
 
-- built-in CLI adapter
-- built-in REST adapter
-- built-in RPC adapter
-- principal/global skill promotion targets
-- deeper child-session policy narrowing beyond tool allowlists
-- distributed or remote subagent execution
+Current RPC methods:
 
-## Next Session
+| RPC Method | Description |
+|---|---|
+| `create_session` | Create a new scoped session. |
+| `open_session` | Reopen an existing session by reference. |
+| `continue_session` | Open the most recent scoped session. |
+| `prompt` | Run a prompt and return a normalized run result. |
+| `snapshot` | Return the current session snapshot. |
+| `set_mode` | Change the active mode. |
+| `fork` | Create a new branch from an earlier entry. |
+| `clone` | Clone the current branch into a new session. |
+| `navigate` | Replay the session to an earlier entry. |
+| `promote_skill` | Persist a generated skill to workspace scope. |
+| `steer` | Queue steering input for an active run. |
+| `follow_up` | Queue follow-up input for an active run. |
+| `abort` | Cancel the active run. |
+| `subscribe` | Subscribe to normalized runtime events on the same stream. |
 
-If you are picking this up next, the recommended order is:
+## Integration Guidance
 
-1. add the first real adapter package under an `adapter` tree
-2. make `CLI` the first adapter using `service.Service` as its only runtime integration point
-3. validate session lifecycle coverage in the CLI:
-   - create/open/continue
-   - prompt/stream
-   - steer/follow-up/abort
-   - fork/clone/navigate
-   - promote-skill
-4. once the CLI shape is stable, build `REST` and `RPC` adapters against the same service surface
+Recommended:
+
+- keep one long-lived `service.Service` per host process
+- keep sessions under a project-local persistence directory
+- use explicit principal and workspace ids for every host request
+- use `Prompt(..., Stream: true)` for interactive hosts
+- subscribe to events instead of polling internal state
+- restrict file and process permissions aggressively
+
+Avoid:
+
+- putting transport-specific logic into `runtime`
+- letting adapters invent their own session semantics
+- relying on unconstrained file or process policy
 
 ## Testing
 
-Run the test suite with:
+Run the suite with:
 
 ```bash
 env GOCACHE=/tmp/memoidness-gocache go test ./...
@@ -489,14 +927,15 @@ In restricted environments, the explicit `GOCACHE` override may be necessary if 
 
 Current MVP limitations:
 
-- no built-in CLI
-- no REST or RPC adapter
-- no built-in adapter packages yet; only the library and `service` integration layer exist
+- no packaged end-user CLI binary
+- no packaged REST server binary
+- no standalone RPC server process
 - no principal/global skill promotion yet
 - no distributed subagent execution yet
 - no provider families beyond OpenAI-compatible chat-completions APIs
-- context discovery is still intentionally small and centered on top-level instruction files plus workspace skills
+- context discovery is intentionally small and focused on top-level guidance files plus workspace skills
+- history inspection surfaces are still thin across the adapter trio
 
 ## Summary
 
-`memoidness` is currently a usable backend runtime for embedding coding-agent behavior into another Go application. If you need a Go-native session loop with policy-gated tools, repository instruction loading, resumable sessions, and ordered events, the current codebase is ready to integrate. If you need a packaged end-user agent product, host adapters and advanced session semantics are still pending.
+`memoidness` is currently a usable backend runtime for embedding coding-agent behavior into another Go application. If you need a Go-native session loop with policy-gated tools, repository instruction loading, resumable sessions, ordered events, and thin reusable CLI, REST, and RPC adapter packages, the current codebase is ready to integrate. If you need a packaged end-user agent product, richer host surfaces and deeper session inspection are still pending.

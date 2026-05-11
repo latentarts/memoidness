@@ -1,6 +1,6 @@
 # memoidness
 
-`memoidness` is a library-first Go runtime for building coding agents.
+`memoidness` is a library-first Go runtime for building coding agents inspired on [pi coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
 
 It gives you one reusable backend surface for:
 
@@ -939,3 +939,9 @@ Current MVP limitations:
 ## Summary
 
 `memoidness` is currently a usable backend runtime for embedding coding-agent behavior into another Go application. If you need a Go-native session loop with policy-gated tools, repository instruction loading, resumable sessions, ordered events, and thin reusable CLI, REST, and RPC adapter packages, the current codebase is ready to integrate. If you need a packaged end-user agent product, richer host surfaces and deeper session inspection are still pending.
+
+---
+
+## License
+
+MIT - [License](LICENSE)

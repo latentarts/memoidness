@@ -16,39 +16,41 @@ The runtime core now has:
 - an initial `adapter/cli` package built on top of `service.Service`
 - an initial `adapter/rest` package built on top of `service.Service`
 - an initial `adapter/rpc` package built on top of `service.Service`
+- expanded README guidance for direct runtime use, `service.Service`, and all three adapters
 
 ## Immediate Next Step
 
-Broaden and harden the first real host adapters.
+Harden the shared host surface behind the adapter trio.
 
 Recommended order:
 
-1. keep `adapter/cli`, `adapter/rest`, and `adapter/rpc` thin and make them depend only on `service.Service` plus transport/rendering code
-2. validate and extend the shared lifecycle coverage through all adapters:
-   - create/open/continue
-   - prompt with streaming output or event delivery
-   - steer/follow-up/abort
-   - fork/clone/navigate
-   - promote-skill
-   - set-mode
-3. add any missing service-facing support that both adapters need, especially around richer history inspection
+1. add richer service-facing inspection and history support that all adapters can reuse
+2. keep `adapter/cli`, `adapter/rest`, and `adapter/rpc` thin while exposing that shared surface
+3. tighten transport behavior where the current first pass is intentionally minimal:
+   - CLI output shaping
+   - REST request and response polish
+   - RPC framing and subscription ergonomics
+4. preserve one behavior model across runtime, service, and all transports
 
 ## Design Constraints
 
 - do not move transport concerns into `runtime`
+- do not let adapter-specific convenience logic become a second orchestration path
 - keep auth/scope resolution at the adapter edge
 - keep event semantics identical to the runtime event stream
 - prefer request/response translation over adapter-specific agent behavior
 
-## After The First Adapter Trio
+## After Shared Inspection
 
-Once the CLI, REST, and RPC shapes are stable:
+Once shared inspection and history surfaces are in place:
 
-1. harden shared inspection and history surfaces
-2. preserve the same `service.Service` operations and event semantics across all transports
+1. harden the adapter trio against real host use
+2. add examples or runnable `examples/` programs if needed
+3. evaluate broader provider support and deeper context loading
 
 ## Still Open
 
+- richer history inspection and listing across adapters
 - principal/global skill promotion
 - distributed subagent execution
 - richer child-session policy narrowing
